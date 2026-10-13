@@ -21,6 +21,7 @@ class TestProfilerConfig(unittest.TestCase):
         self.assertIsNone(cfg.profiler_repeat)
         self.assertIsNone(cfg.profiler_skip_first)
         self.assertIsNone(cfg.profiler_skip_first_wait)
+        self.assertIsNone(cfg.with_stack)
         self.assertFalse(cfg.enable_memory_snapshot)
         self.assertEqual(cfg.save_memory_snapshot_folder, "profiling/memory_snapshot")
         self.assertIsNone(cfg.memory_snapshot_freq)
@@ -153,6 +154,28 @@ class TestProfilerEnabledPaths(unittest.TestCase):
     def tearDown(self):
         self.patcher_rank.stop()
 
+    def _torch_profiler_kwargs(self, base_folder, *, device_type, **config_kwargs):
+        """Build the torch profiler on a stubbed device, returning profile() kwargs."""
+        with (
+            mock.patch("torch.cuda.is_available", return_value=False),
+            mock.patch("torch.xpu.is_available", return_value=False),
+            mock.patch("torchtitan.observability.profiler.device_type", device_type),
+            mock.patch("torch.profiler.profile") as profile,
+        ):
+            profiler = Profiler(
+                Profiler.Config(
+                    enable_profiling=True,
+                    profile_freq=4,
+                    profiler_warmup=1,
+                    profiler_active=1,
+                    **config_kwargs,
+                )
+            )
+            profiler.build_torch_profiler(
+                global_step=0, base_folder=base_folder, leaf_folder=""
+            )
+            return profile.call_args.kwargs
+
     def test_build_torch_profiler_returns_active_handle(self):
         import tempfile
 
@@ -203,6 +226,44 @@ class TestProfilerEnabledPaths(unittest.TestCase):
             ],
         )
         self.assertTrue(profile.call_args.kwargs["with_stack"])
+
+    def test_with_stack_defaults_off_on_non_neuron_device(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            kwargs = self._torch_profiler_kwargs(tmpdir, device_type="cpu")
+
+        self.assertFalse(kwargs["with_stack"])
+
+    def test_with_stack_enabled_by_config(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            kwargs = self._torch_profiler_kwargs(
+                tmpdir, device_type="cpu", with_stack=True
+            )
+
+        self.assertTrue(kwargs["with_stack"])
+
+    def test_with_stack_can_be_disabled_on_neuron(self):
+        import tempfile
+
+        import torch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            kwargs = self._torch_profiler_kwargs(
+                tmpdir, device_type="neuron", with_stack=False
+            )
+
+        self.assertFalse(kwargs["with_stack"])
+        # Disabling stacks must not change the activities selected for Neuron.
+        self.assertEqual(
+            kwargs["activities"],
+            [
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ],
+        )
 
     def test_memory_snapshot_frequency_is_independent(self):
         import tempfile

@@ -175,6 +175,15 @@ class Profiler(Configurable):
         This is used to configure torch.profiler.schedule.
         """
 
+        with_stack: bool | None = None
+        """Whether to record Python stack traces for profiler events.
+
+        This is passed to ``torch.profiler.profile``. ``None`` keeps the per-device
+        default: stacks are recorded on Neuron, where they link framework events to
+        source lines, and disabled elsewhere. Recording stacks on other devices
+        makes traces much larger and slows down capture, including for CUDA kernels.
+        """
+
         enable_memory_snapshot: bool = False
         """Whether to dump memory snapshot."""
 
@@ -357,15 +366,18 @@ class Profiler(Configurable):
 
         wait = profile_freq - (active + warmup)
         activities = [torch.profiler.ProfilerActivity.CPU]
-        with_stack = False
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         elif torch.xpu.is_available():
             activities.append(torch.profiler.ProfilerActivity.XPU)
         elif device_type == "neuron":
             activities.append(torch.profiler.ProfilerActivity.PrivateUse1)
-            # Neuron can link framework events to source lines through the stacks.
-            with_stack = True
+
+        # Neuron can link framework events to source lines through the stacks, so
+        # it records them by default; other devices do not unless configured to.
+        with_stack = cfg.with_stack
+        if with_stack is None:
+            with_stack = device_type == "neuron"
 
         torch_profiler = torch.profiler.profile(
             activities=activities,
