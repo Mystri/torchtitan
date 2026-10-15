@@ -61,6 +61,7 @@ class TokenDispatcherTransform(ModelConfigTransform):
             values: dict[str, Any] = {
                 "num_experts": existing.num_experts,
                 "top_k": existing.top_k,
+                "absorb_router_scores": existing.absorb_router_scores,
                 **self.kwargs,
             }
             if "hidden_dim" in config_fields:

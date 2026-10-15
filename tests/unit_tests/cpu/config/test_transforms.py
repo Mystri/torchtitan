@@ -48,6 +48,7 @@ from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     DeepEPTokenDispatcher,
+    HybridEPTokenDispatcher,
 )
 from torchtitan.models.common.vision_encoder import InvariantRowParallelLinear
 
@@ -377,6 +378,38 @@ class TestTransformModel(unittest.TestCase):
         for dispatcher in dispatchers:
             self.assertIsInstance(dispatcher, DeepEPTokenDispatcher.Config)
             self.assertEqual(dispatcher.num_max_tokens_per_rank, 128)
+
+    def test_token_dispatcher_transform_forwards_absorb_router_scores(self):
+        from torchtitan_recipes.tests.models.deepseek_v3 import deepseek_v3_debugmodel
+
+        # make_routed_experts_config defaults absorb_router_scores to None (auto).
+        # The transform must forward it to the replacement instead of resetting
+        # it to the dispatcher class default (False).
+        for dispatcher_cls in (DeepEPTokenDispatcher, HybridEPTokenDispatcher):
+            with self.subTest(dispatcher=dispatcher_cls.__qualname__):
+                config = deepseek_v3_debugmodel(
+                    parallelism=ParallelismConfig(
+                        expert_parallel_degree=2, tensor_parallel_degree=2
+                    )
+                )
+                transformed = apply_transforms(
+                    config,
+                    [
+                        TokenDispatcherTransform(
+                            dispatcher=dispatcher_cls, num_max_tokens_per_rank=128
+                        )
+                    ],
+                )
+                dispatchers = [
+                    routed_experts.token_dispatcher
+                    for _, routed_experts, _, _ in transformed.model.traverse(
+                        RoutedExperts.Config
+                    )
+                ]
+                self.assertTrue(dispatchers)
+                for dispatcher in dispatchers:
+                    self.assertIsInstance(dispatcher, dispatcher_cls.Config)
+                    self.assertIsNone(dispatcher.absorb_router_scores)
 
     def test_token_dispatcher_transform_validates_ep_buffer_capacity(self):
         with self.assertRaisesRegex(ValueError, "num_max_tokens_per_rank"):

@@ -477,9 +477,9 @@ def make_routed_experts_config(
 
     ``absorb_router_scores`` is forwarded to the standard dispatcher. ``None``
     (auto) absorbs the router scores before W2 unless RoutedExperts carries an
-    output_postprocess, which must see unscaled expert outputs. DeepEP-family
-    dispatchers are installed later by TokenDispatcherTransform; their fused
-    combines apply the scores themselves, so they keep their own opt-in default.
+    output_postprocess, which must see unscaled expert outputs. When a
+    TokenDispatcherTransform replaces the standard dispatcher with a
+    DeepEP-family dispatcher, the same value is forwarded to the replacement.
     """
     missing = {"w1_EFD", "w2_EDF", "w3_EFD"} - param_init.keys()
     if param_init and missing:
