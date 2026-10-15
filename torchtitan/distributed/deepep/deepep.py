@@ -614,6 +614,7 @@ def combine_tokens(
     state: DispatchState,
     *,
     remat_region_name: str,
+    recompute: bool,
 ) -> torch.Tensor:
     """Combine expert outputs back to tokens via DeepEP v2.
 
@@ -630,6 +631,8 @@ def combine_tokens(
         hidden_states: Raw (unweighted) expert outputs [num_recv, hidden].
         state: Dispatch state from ``dispatch_tokens``.
         remat_region_name: Name for the combine communication region.
+        recompute: Whether activation remat replays the combine communication during
+            backward. Must match the ``recompute`` passed to ``dispatch_tokens``.
 
     Returns:
         Combined tokens [num_tokens, hidden_dim].
@@ -638,33 +641,29 @@ def combine_tokens(
     # backward) or leaves it for combine-backward. Evaluated here, before the op.
     will_backward = torch.is_grad_enabled()
 
-    def _scored_combine(hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply scores/unpermute and launch the reduction op.
+    if not state.cuda_graph_compatible:
+        assert state.permuted_indices is not None
+        if state.permuted_scores is not None:
+            hidden_states = hidden_states * state.permuted_scores.to(
+                hidden_states.dtype
+            ).reshape(-1, 1)
+        hidden_states = _unpermute_tokens(
+            hidden_states, state.permuted_indices, state.num_recv_tokens
+        )
+    elif state.recv_scores is not None:
+        # One routing score per received row (each row is one token->expert assignment).
+        # Collapse the trailing dim with sum so this is correct whether recv_scores is
+        # [num_recv], [num_recv, 1], or [num_recv, topk] with a single valid entry/row.
+        per_row_score = state.recv_scores.reshape(hidden_states.shape[0], -1).sum(
+            dim=-1, keepdim=True
+        )
+        hidden_states = hidden_states * per_row_score.to(hidden_states.dtype)
 
-        Runs as one never-replayed region, so the expert outputs are read only
-        by this saved body; nothing on the replay path touches them.
-        """
-        if not state.cuda_graph_compatible:
-            assert state.permuted_indices is not None
-            if state.permuted_scores is not None:
-                hidden_states = hidden_states * state.permuted_scores.to(
-                    hidden_states.dtype
-                ).reshape(-1, 1)
-            hidden_states = _unpermute_tokens(
-                hidden_states, state.permuted_indices, state.num_recv_tokens
-            )
-        elif state.recv_scores is not None:
-            # One routing score per received row (each row is one token->expert assignment).
-            # Collapse the trailing dim with sum so this is correct whether recv_scores is
-            # [num_recv], [num_recv, 1], or [num_recv, topk] with a single valid entry/row.
-            per_row_score = state.recv_scores.reshape(hidden_states.shape[0], -1).sum(
-                dim=-1, keepdim=True
-            )
-            hidden_states = hidden_states * per_row_score.to(hidden_states.dtype)
-        return torch.ops.deepep.combine(hidden_states, state.handle_id, will_backward)
-
-    return remat.region(
-        _scored_combine,
+    combined = remat.region(
+        torch.ops.deepep.combine,
         remat_region_name,
-        recompute=False,  # never replayed; the W2 output is read only by this body
-    )(hidden_states)
+        recompute=recompute,
+    )(hidden_states, state.handle_id, will_backward)
+    # The caller consumes this output outside another remat region.
+    remat.recompute_needs_tensor(combined)
+    return combined

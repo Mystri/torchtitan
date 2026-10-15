@@ -1039,10 +1039,14 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
         del x_TD
         from torchtitan.distributed.deepep.deepep import combine_tokens, sync_combine
 
+        # combine_tokens applies routing scores with bare ops.
+        remat.recompute_needs_tensor(routed_output_RD)
+
         combined_TD = combine_tokens(
             routed_output_RD,
             metadata.state,  # pyrefly: ignore [bad-argument-type]
             remat_region_name=self.remat_region_name("ep_communication.combine"),
+            recompute=self._replays_communication(),
         )
         sync_combine()
         return combined_TD
