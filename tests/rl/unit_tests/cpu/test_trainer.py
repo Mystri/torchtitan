@@ -24,7 +24,7 @@ from torchtitan.rl.actors.monarch.trainer import TrainerActor
 from torchtitan.rl.trainer.batcher import TrainingMicrobatch
 from torchtitan.rl.trainer.controller_state import MirroredState
 from torchtitan.rl.trainer.rdma_microbatch import (
-    MonarchRDMAMicrobatch,
+    RDMAMicrobatch,
     RDMAMicrobatchPrefetcher,
 )
 from torchtitan.rl.trainer.trainer import Trainer
@@ -275,7 +275,7 @@ def test_forward_backward_uses_global_token_count() -> None:
         _run_forward_backward=MagicMock(
             return_value=ForwardBackwardResult(torch.tensor(1.0), [])
         ),
-        _cuda_graph_per_accumulation_group_enabled=False,
+        _cuda_graph_per_microbatch_group_enabled=False,
         sdc_replayer=None,
     )
     microbatch_groups = [[object()], [object()], [object()]]
@@ -390,12 +390,11 @@ def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
             advantages=torch.tensor([1.0]),
         )
 
-        # This rank (dp_rank 1) reads only its own column.
-        if rdma:
-            other_rank = MagicMock(spec=MonarchRDMAMicrobatch)
-            own = [
+        # This rank's column (dp_rank 1); with `rdma_min_tensor_bytes` the trainer reads it.
+        microbatches = (
+            [
                 MagicMock(
-                    spec=MonarchRDMAMicrobatch,
+                    spec=RDMAMicrobatch,
                     read=AsyncMock(return_value=batch),
                     batch_index=0,
                     dp_rank=1,
@@ -403,12 +402,13 @@ def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
                 )
                 for microbatch_index in range(2)
             ]
-        else:
-            other_rank, own = MagicMock(spec=TrainingMicrobatch), [batch, batch]
+            if rdma
+            else [batch, batch]
+        )
 
         result = await Trainer.forward_backward(
             trainer,
-            [[other_rank, own[0]], [other_rank, own[1]]],
+            microbatches,
             torch.tensor([3]),
             torch.tensor([2]),
         )
@@ -418,7 +418,7 @@ def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
             global_loss_token_counts=torch.tensor([3]),
             global_routing_token_counts=torch.tensor([2]),
         )
-        # MonarchRDMAMicrobatches are read through the prefetcher; by value, the column is passed as is.
+        # RDMAMicrobatches are read through the prefetcher; by value, the column is passed as is.
         groups = engine.forward_backward.call_args.kwargs["microbatch_groups"]
         assert isinstance(groups, RDMAMicrobatchPrefetcher) == rdma
         assert list(groups) == [[batch], [batch]]
@@ -426,7 +426,6 @@ def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
             2 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank
         )
         if rdma:
-            other_rank.read.assert_not_called()
             assert trainer._num_rdma_batches_read == 1
             # The read time is reported only when there was a read.
             assert result.pop("timing/trainer/read_microbatches/max") >= 0
@@ -450,7 +449,7 @@ def test_forward_backward_rejects_a_misplaced_rdma_microbatch(
     trainer.dp_rank = 1
     trainer._num_rdma_batches_read = 0
     wrong = MagicMock(
-        spec=MonarchRDMAMicrobatch,
+        spec=RDMAMicrobatch,
         batch_index=batch_index,
         dp_rank=dp_rank,
         microbatch_index=microbatch_index,
@@ -459,7 +458,7 @@ def test_forward_backward_rejects_a_misplaced_rdma_microbatch(
     with pytest.raises(ValueError, match=r"expected \(0, 1, 0\)"):
         asyncio.run(
             Trainer.forward_backward(
-                trainer, [[MagicMock(), wrong]], torch.tensor([1]), torch.tensor([1])
+                trainer, [wrong], torch.tensor([1]), torch.tensor([1])
             )
         )
     wrong.read.assert_not_called()

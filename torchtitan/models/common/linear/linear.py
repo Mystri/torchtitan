@@ -25,7 +25,7 @@ import torch_remat as remat
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.models.base.module import Module
-from torchtitan.models.common.inplace_wgrad_accum import (
+from torchtitan.models.common.linear.inplace_wgrad_accum import (
     running_grad,
     uses_inplace_wgrad_accum,
 )
@@ -165,10 +165,12 @@ class _LinearFunction(torch.autograd.Function):
 
     ``Linear._linear`` uses it only when in-place WGRAD accumulation is on.
     Without a running gradient it computes the same GEMMs as ``F.linear``'s
-    autograd formula, so the gradients are bitwise identical. Later
-    contributions use ``addmm(out=weight.grad)``, which adds the GEMM's fp32
-    accumulator into the running gradient instead of first rounding the WGRAD
-    to the weight dtype.
+    autograd formula, so the gradients are bitwise identical, except that a
+    WGRAD whose ``weight.grad_dtype`` is wider than the input (e.g. FSDP's
+    fp32 reduce dtype) comes out of the GEMM in that dtype instead of being
+    rounded to the input dtype and upcast by autograd. Later contributions use
+    ``addmm(out=weight.grad)``, which adds the GEMM's fp32 accumulator into the
+    running gradient instead of first rounding the WGRAD to the weight dtype.
     """
 
     @staticmethod
@@ -203,7 +205,19 @@ class _LinearFunction(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             grad = running_grad(weight)
             if grad is None:
-                grad_weight = grad_MN.t().mm(input_MK).view(weight.shape)
+                # Produce the WGRAD in the parameter's grad_dtype (e.g. FSDP's
+                # fp32 reduce dtype on a microbatch with gradient sync
+                # disabled) from the GEMM's fp32 accumulator, rather than
+                # rounding it to the input dtype for autograd to upcast.
+                # grad_dtype None (FSDP deferring the upcast) accepts any.
+                # out_dtype only when it differs from the inputs': CPU has no
+                # mm(out_dtype=) kernel, even when it matches them.
+                grad_dtype = weight.grad_dtype
+                if grad_dtype is None or grad_dtype == input_MK.dtype:
+                    grad_weight = grad_MN.t().mm(input_MK)
+                else:
+                    grad_weight = torch.mm(grad_MN.t(), input_MK, out_dtype=grad_dtype)
+                grad_weight = grad_weight.view(weight.shape)
             else:
                 # A later microbatch or chunk: add into the running gradient in
                 # the GEMM epilogue. Then hand the same buffer back and clear
@@ -391,17 +405,36 @@ class GroupedLinear(Module):
             torch.empty(config.group_size, *output_shape, config.in_features)
         )
 
-    def forward(self, input_RI: torch.Tensor, offsets_E: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_RI: torch.Tensor,
+        offsets_E: torch.Tensor,
+        *,
+        routed_scores_R: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Apply each grouped linear to rows selected by cumulative offsets.
 
         Args:
             input_RI: Input rows grouped by the selected linear.
             offsets_E: Exclusive cumulative row end for each group.
+            routed_scores_R: Optional per-row router scores to absorb into the
+                input, one per input row. Router scores are produced in
+                float32; rows are scaled in float32 and cast back to the input
+                dtype so the grouped GEMM sees its usual operand type.
 
         Returns:
             Output rows with an optional ``num_linears`` axis before the output
             feature axis.
         """
+        if routed_scores_R is not None:
+            # On the standard all-to-all path the scores are an output of the
+            # dispatcher's saved dispatch region; this scaling is a bare
+            # consumer, so replay needs them persisted. No-op when the scores
+            # are bare-produced (DeepEP/HybridEP) or without a checkpoint.
+            remat.recompute_needs_tensor(routed_scores_R)
+            input_RI = (input_RI.float() * routed_scores_R.reshape(-1, 1)).to(
+                input_RI.dtype
+            )
         output_shape = self.weight.shape[1:-1]
         weight_EOI = self.weight.flatten(1, -2)
         output_RO = remat.region(

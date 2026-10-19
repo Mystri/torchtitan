@@ -31,7 +31,7 @@ from torchtitan.rl.controller.metrics import combine_microbatch_metrics
 from torchtitan.rl.trainer.batcher import TrainingMicrobatch
 from torchtitan.rl.trainer.controller_state import CONTROLLER_STATE_KEY, MirroredState
 from torchtitan.rl.trainer.rdma_microbatch import (
-    MonarchRDMAMicrobatch,
+    RDMAMicrobatch,
     RDMAMicrobatchPrefetcher,
 )
 from torchtitan.tools import utils
@@ -245,18 +245,15 @@ class Trainer(Configurable):
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
-        training_data: (
-            list[list[TrainingMicrobatch]] | list[list[MonarchRDMAMicrobatch]]
-        ),
+        microbatches: list[TrainingMicrobatch] | list[RDMAMicrobatch],
         global_loss_token_counts: torch.Tensor,
         global_routing_token_counts: torch.Tensor,
     ) -> dict[str, float]:
         """Run one optimizer step's forward/backward microbatches.
 
         Args:
-            training_data: Microbatch-major grid with shape
-                ``[num_microbatches][dp_degree]``; `MonarchRDMAMicrobatch`es when
-                `rdma_min_tensor_bytes` is set, read a few microbatches ahead of training.
+            microbatches: This rank's column of the batcher's `[num_microbatches][dp_degree]` grid;
+                `RDMAMicrobatch`es when `rdma_min_tensor_bytes` is set, read a few ahead of training.
             global_loss_token_counts: Per-objective loss-token counts across the
                 global batch.
             global_routing_token_counts: Per-depth non-padding routing-token
@@ -264,6 +261,11 @@ class Trainer(Configurable):
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
+
+        Example:
+            # dp_degree=2, tp=2, grid = [[mb_00, mb_01], [mb_10, mb_11]]
+            # ranks 0, 1 (DP rank 0) get microbatches = [mb_00, mb_10]
+            # ranks 2, 3 (DP rank 1) get microbatches = [mb_01, mb_11]
         """
         logger.debug(
             f"{os.getpid()=} Trainer forward_backward "
@@ -271,15 +273,12 @@ class Trainer(Configurable):
         )
         engine = self.engine
         self._step_compute_start = time.perf_counter()
-        microbatches = [rank_batches[self.dp_rank] for rank_batches in training_data]
         # The batcher pads every microbatch to the same token count.
         self._step_num_tokens_per_dp_rank = (
             len(microbatches)
             * self.config.training.num_tokens_per_microbatch_per_dp_rank
         )
-        uses_rdma = bool(microbatches) and isinstance(
-            microbatches[0], MonarchRDMAMicrobatch
-        )
+        uses_rdma = bool(microbatches) and isinstance(microbatches[0], RDMAMicrobatch)
         microbatch_groups = [[microbatch] for microbatch in microbatches]
         if uses_rdma:
             # A wrong column, or a batch read twice or out of order, fails here instead of training.

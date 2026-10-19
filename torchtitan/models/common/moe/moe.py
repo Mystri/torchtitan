@@ -37,9 +37,9 @@ from torchtitan.models.common.activation import (
     UnaryActivationFn,
 )
 from torchtitan.models.common.aux_loss import AuxLoss
-from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.feed_forward import DenseFeedForward, FeedForward
 from torchtitan.models.common.linear import GroupedLinear
+from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
 
 from .token_dispatcher import LocalTokenDispatcher
 
@@ -85,6 +85,22 @@ class RoutedExperts(Module):
                 raise ValueError("w13 output and w2 input dimensions must match")
             if self.w2.num_linears != 1:
                 raise ValueError("w2 must contain one down projection")
+            if (
+                self.output_postprocess is not None
+                and self.token_dispatcher.absorb_router_scores
+            ):
+                # Absorbed scores scale W2's input, so the postprocess would see
+                # score-scaled outputs; the post-combine path instead applies the
+                # score after the postprocess. Only a linear postprocess keeps
+                # those equivalent, and a scale-invariant one (e.g. RMSNorm)
+                # would drop the score entirely. ``absorb_router_scores=None``
+                # (auto) is resolved against this postprocess at build time.
+                raise ValueError(
+                    "output_postprocess and absorb_router_scores cannot be "
+                    "combined: absorbed router scores are applied before W2, "
+                    "while output_postprocess runs after it. Set "
+                    "absorb_router_scores=False or drop output_postprocess."
+                )
 
     def __init__(self, config: Config):
         super().__init__()
@@ -97,6 +113,11 @@ class RoutedExperts(Module):
             else None
         )
         self.token_dispatcher = config.token_dispatcher.build()
+        if config.token_dispatcher.absorb_router_scores is None:
+            # Auto: resolve here rather than in the config builder, since a
+            # caller may attach output_postprocess to an already-built config.
+            # A post-W2 postprocess must see unscaled expert outputs.
+            self.token_dispatcher.absorb_router_scores = self.output_postprocess is None
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         del buffer_device
@@ -139,6 +160,7 @@ class RoutedExperts(Module):
             dtype=torch.int32,
         )
 
+        routed_scores_R = getattr(metadata, "routed_scores_R", None)
         with maybe_set_sparse_mesh():
             # w13 and w2 declare their own remat regions (<fqn>.grouped_mm).
             # The bf16 cast reads the dispatched tokens with bare ops.
@@ -146,7 +168,12 @@ class RoutedExperts(Module):
             gate_up_R2F = self.w13(routed_input_RD.bfloat16(), offsets_E)
             remat.recompute_needs_tensor(gate_up_R2F)
             hidden_RF = self.activation_fn(gate_up_R2F, offsets=offsets_E)
-            routed_output_RD = self.w2(hidden_RF, offsets_E)
+            # Widen W2's contract only when a score is actually absorbed, so
+            # W2 modules that do not know about scores keep working unchanged.
+            w2_kwargs = (
+                {} if routed_scores_R is None else {"routed_scores_R": routed_scores_R}
+            )
+            routed_output_RD = self.w2(hidden_RF, offsets_E, **w2_kwargs)
             # A real dtype cast and the output postprocess read the w2 output with
             # bare ops, so pin it only then. In the common bf16 case without a
             # postprocess, type_as is a no-op and the w2 output goes straight to
@@ -704,7 +731,7 @@ class BatchWiseLoadBalanceLoss(AuxLoss):
             return self.inject(loss, carrier=carrier, denominator=denominator)
 
 
-class MoE(Module):
+class MoE(FeedForward):
     """Mixture of Experts layer.
 
     The forward pass proceeds as:
@@ -724,7 +751,7 @@ class MoE(Module):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
+    class Config(FeedForward.Config):
         num_experts: int = 8
         routed_experts: RoutedExperts.Config
         router: TokenChoiceTopKRouter.Config
@@ -732,7 +759,7 @@ class MoE(Module):
         freeze_expert_bias: bool = False
         """Route with ``expert_bias_E`` but never update it: no balancing hook is registered.
         ``load_balance_coeff=None`` instead removes the bias from routing."""
-        shared_experts: FeedForward.Config | None = None
+        shared_experts: DenseFeedForward.Config | None = None
 
         def __post_init__(self) -> None:
             expert_counts = {
@@ -961,6 +988,7 @@ def register_moe_load_balancing_hook(
         model_parts: List of model parts that may contain MoE layers.
         parallelism_context: Parallel dimensions for distributed communication.
     """
+    from torchtitan.models.common.decoder import TransformerBlock
 
     def _iter_moe_layers(
         model_parts: list[nn.Module],
@@ -978,8 +1006,10 @@ def register_moe_load_balancing_hook(
             for layers in layer_containers:
                 assert isinstance(layers, (nn.ModuleDict, nn.ModuleList))
                 for transformer_block in layers.children():
-                    if getattr(transformer_block, "moe_enabled", False):
-                        yield transformer_block, cast(_MoELike, transformer_block.moe)
+                    if isinstance(transformer_block, TransformerBlock) and isinstance(
+                        moe := transformer_block.feed_forward, MoE
+                    ):
+                        yield transformer_block, cast(_MoELike, moe)
 
     # for MoE auxiliary-loss-free load balancing
     def _update_expert_bias(
