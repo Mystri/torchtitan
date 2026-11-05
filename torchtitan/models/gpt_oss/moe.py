@@ -15,6 +15,9 @@ from torch import nn
 
 from torchtitan.models.common.linear import GroupedLinear
 
+# Shape suffix legend: R = routed rows, E = experts, I = input features,
+# O = flattened output features, including stacked projections.
+
 
 class GptOssGroupedLinear(GroupedLinear):
     """Grouped linear with GPT-OSS per-expert bias."""
@@ -27,14 +30,28 @@ class GptOssGroupedLinear(GroupedLinear):
         super().__init__(config)
         self.bias = nn.Parameter(torch.empty(self.weight.shape[:-1]))
 
-    def forward(self, input_RI: torch.Tensor, offsets_E: torch.Tensor) -> torch.Tensor:
-        output_RO = super().forward(input_RI, offsets_E)
-        # The bias add below reads the grouped_mm output with bare ops.
-        remat.recompute_needs_tensor(output_RO)
+    def forward(
+        self,
+        input_RI: torch.Tensor,
+        offsets_E: torch.Tensor,
+        *,
+        routed_scores_R: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output_RO = super().forward(
+            input_RI, offsets_E, routed_scores_R=routed_scores_R
+        )
         bias_RO = self._expand_grouped_bias(
             self.bias.flatten(1), offsets_E, output_RO.shape[0]
-        ).reshape_as(output_RO)
-        return self._add_grouped_bias(output_RO, bias_RO)
+        )
+        if routed_scores_R is not None:
+            bias_RO = bias_RO.to(output_RO.dtype) * routed_scores_R.to(
+                output_RO.dtype
+            ).reshape(-1, 1)
+        return remat.region(
+            self._add_grouped_bias,
+            self.remat_region_name("bias_add"),
+            recompute=self.remat_should_recompute("bias_add"),
+        )(output_RO, bias_RO.reshape_as(output_RO))
 
     @staticmethod
     def _expand_grouped_bias(
