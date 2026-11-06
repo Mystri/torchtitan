@@ -799,12 +799,6 @@ class EPDispatchMetadata:
     """Metadata for DeepEP and HybridEP token dispatch."""
 
     state: object  # Backend-specific dispatch state.
-
-
-@dataclass(frozen=True, kw_only=True)
-class DeepEPDispatchMetadata(EPDispatchMetadata):
-    """DeepEP dispatch state and per-row router scores."""
-
     scores_R: torch.Tensor  # noqa: N815
 
 
@@ -890,7 +884,7 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
         topk_scores_TK: torch.Tensor,
         topk_expert_ids_TK: torch.Tensor,
         routing_map_TE: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, DeepEPDispatchMetadata]:
+    ) -> tuple[torch.Tensor, torch.Tensor, EPDispatchMetadata]:
         """Dispatch through the preallocated ElasticBuffer."""
         # Ignore input routing_map_TE. DeepEP returns the number
         # of global routed tokens for every local expert using other inputs.
@@ -921,14 +915,14 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
             cuda_graph_compatible=self.cuda_graph_compatible,
         )
 
-        metadata = DeepEPDispatchMetadata(state=state, scores_R=scores_R)
+        metadata = EPDispatchMetadata(state=state, scores_R=scores_R)
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
 
     # pyrefly: ignore [bad-override]
     def combine(
         self,
         routed_output_RD: torch.Tensor,
-        metadata: DeepEPDispatchMetadata,
+        metadata: EPDispatchMetadata,
         x_TD: torch.Tensor,
     ) -> torch.Tensor:
         """Combine scored tokens via DeepEP and wait for completion."""
@@ -952,9 +946,9 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
     """Token dispatcher using HybridEP for efficient token dispatch/combine.
 
     Uses HybridEP library kernels instead of standard all-to-all collectives.
-    Dispatch and combine follow one remat policy, ``ep_communication``, because
-    backward consumes the forward dispatch handle. HybridEP's prefix scans
-    preserve token order when communication is replayed.
+    Dispatch replay follows ``ep_communication``. HybridEP's prefix scans
+    preserve token order when dispatch is replayed. Combine consumes weighted
+    expert outputs and is never replayed.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -1044,7 +1038,12 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
 
         from torchtitan.distributed.deepep.hybridep import dispatch_tokens
 
-        hidden_states_RD, num_global_tokens_per_local_expert_e, state = dispatch_tokens(
+        (
+            hidden_states_RD,
+            num_global_tokens_per_local_expert_e,
+            scores_R,
+            state,
+        ) = dispatch_tokens(
             x_TD,
             topk_expert_ids_TK,
             topk_scores_TK,
@@ -1057,7 +1056,7 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
             pad_multiple=self.pad_multiple,
         )
 
-        metadata = EPDispatchMetadata(state=state)
+        metadata = EPDispatchMetadata(state=state, scores_R=scores_R)
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
 
     # pyrefly: ignore [bad-override]
@@ -1067,18 +1066,16 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
         metadata: EPDispatchMetadata,
         x_TD: torch.Tensor,
     ) -> torch.Tensor:
-        """Combine tokens via HybridEP."""
+        """Combine scored tokens via HybridEP."""
         del x_TD
 
         from torchtitan.distributed.deepep import hybridep
 
-        # combine_tokens applies routing scores and combines with bare ops.
-        remat.recompute_needs_tensor(routed_output_RD)
-        combined_TD = hybridep.combine_tokens(
-            routed_output_RD,
-            metadata.state,  # pyrefly: ignore [bad-argument-type]
-            remat_region_name=self.remat_region_name("ep_communication.combine"),
-            recompute=self.remat_should_recompute("ep_communication"),
-            pad_multiple=self.pad_multiple,
-        )
+        # Combine backward uses the dispatch handle, not the expert output.
+        # Saving the reduction avoids retaining or rebuilding W2's output.
+        combined_TD = remat.region(
+            hybridep.combine_tokens,
+            self.remat_region_name("ep_communication.combine"),
+            recompute=False,
+        )(routed_output_RD, metadata.state, pad_multiple=self.pad_multiple)
         return combined_TD

@@ -13,10 +13,10 @@ asset-path hints without shipping unverified full training recipes.
 - FSDP/HSDP, TP, EP, CP, PP
 - Grouped matrix multiplication for efficient computation
 
-With DeepEP and no expert output postprocess, router scores scale W2's input
-and its per-expert bias. In the equation below, `b2` is expanded along the
-routed-token dimension: each row receives its selected expert's bias, and `s`
-broadcasts over that row's features.
+With DeepEP or HybridEP and no expert output postprocess, router scores scale
+W2's input and its per-expert bias. In the equation below, `b2` is expanded
+along the routed-token dimension: each row receives its selected expert's
+bias, and `s` broadcasts over that row's features.
 
 ```text
 s * (W2(h) + b2) = W2(s * h) + s * b2
