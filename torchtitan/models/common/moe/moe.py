@@ -41,7 +41,7 @@ from torchtitan.models.common.feed_forward import DenseFeedForward, FeedForward
 from torchtitan.models.common.linear import GroupedLinear
 from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
 
-from .token_dispatcher import LocalTokenDispatcher
+from .token_dispatcher import DeepEPDispatchMetadata, LocalTokenDispatcher
 
 # Shape suffix legend
 # (https://medium.com/@NoamShazeer/shape-suffixes-good-coding-style-f836e72e24fd):
@@ -146,7 +146,15 @@ class RoutedExperts(Module):
             gate_up_R2F = self.w13(routed_input_RD.bfloat16(), offsets_E)
             remat.recompute_needs_tensor(gate_up_R2F)
             hidden_RF = self.activation_fn(gate_up_R2F, offsets=offsets_E)
-            routed_output_RD = self.w2(hidden_RF, offsets_E)
+            if (
+                isinstance(metadata, DeepEPDispatchMetadata)
+                and self.output_postprocess is None
+            ):
+                routed_output_RD = self.w2(
+                    hidden_RF, offsets_E, scores_R=metadata.scores_R
+                )
+            else:
+                routed_output_RD = self.w2(hidden_RF, offsets_E)
             # A real dtype cast and the output postprocess read the w2 output with
             # bare ops, so pin it only then. In the common bf16 case without a
             # postprocess, type_as is a no-op and the w2 output goes straight to
@@ -160,6 +168,14 @@ class RoutedExperts(Module):
             routed_output_RD = routed_output_RD.type_as(routed_input_RD)
             if self.output_postprocess is not None:
                 routed_output_RD = self.output_postprocess(routed_output_RD)
+                if isinstance(metadata, DeepEPDispatchMetadata):
+                    # A nonlinear postprocess must run before score multiplication.
+                    remat.recompute_needs_tensor(routed_output_RD, metadata.scores_R)
+                    # Promote the product without saving a float32 output copy.
+                    routed_output_RD = (
+                        routed_output_RD
+                        * metadata.scores_R.reshape(-1, 1).to(torch.float32)
+                    ).to(routed_output_RD.dtype)
         out_TD = self.token_dispatcher.combine(
             routed_output_RD,
             metadata,
@@ -960,7 +976,6 @@ def register_moe_load_balancing_hook(
         model_parts: List of model parts that may contain MoE layers.
         parallelism_context: Parallel dimensions for distributed communication.
     """
-    from torchtitan.models.common.decoder import TransformerBlock
 
     def _iter_moe_layers(
         model_parts: list[nn.Module],
@@ -978,10 +993,9 @@ def register_moe_load_balancing_hook(
             for layers in layer_containers:
                 assert isinstance(layers, (nn.ModuleDict, nn.ModuleList))
                 for transformer_block in layers.children():
-                    if isinstance(transformer_block, TransformerBlock) and isinstance(
-                        moe := transformer_block.feed_forward, MoE
-                    ):
-                        yield transformer_block, cast(_MoELike, moe)
+                    for moe in transformer_block.children():
+                        if isinstance(moe, MoE):
+                            yield transformer_block, cast(_MoELike, moe)
 
     # for MoE auxiliary-loss-free load balancing
     def _update_expert_bias(
